@@ -52,8 +52,8 @@ function FeedItem({
         style={{
           backgroundColor: bgColor,
           fontFamily: "MaryLouise, serif",
-          aspectRatio: "3/4",
-          width: "min(92vw, calc((100dvh - 160px) * 0.75))",
+          aspectRatio: "4/3",
+          width: "min(92vw, calc((100dvh - 160px) * (4/3)))",
         }}
       >
         {/* Top-right photos */}

@@ -1,6 +1,12 @@
 "use client";
 
-import { useState, useCallback, useEffect, useRef } from "react";
+import { useState, useCallback, useEffect, useRef, useMemo } from "react";
+import { prepareWithSegments, layoutNextLine, type LayoutCursor } from "@chenglou/pretext";
+
+/* ─── Constants ──────────────────────────────────────────────────────────── */
+
+const WRAP_WIDTH = 280;
+const LINE_HEIGHT_RATIO = 1.35;
 
 /* ─── Types ──────────────────────────────────────────────────────────────── */
 
@@ -10,8 +16,18 @@ interface CanvasImage {
   src: string;
   x: number;
   y: number;
-  width: number;
+  fullWidth: number;  // natural display size before crop
+  fullHeight: number; // natural display size before crop
+  shape: "rect" | "circle";
+  cropLeft: number;
+  cropTop: number;
+  cropRight: number;
+  cropBottom: number;
 }
+
+// Derived helpers
+function imgFrameW(img: CanvasImage) { return Math.max(10, img.fullWidth - img.cropLeft - img.cropRight); }
+function imgFrameH(img: CanvasImage) { return Math.max(10, img.fullHeight - img.cropTop - img.cropBottom); }
 
 interface CanvasText {
   kind: "text";
@@ -20,16 +36,68 @@ interface CanvasText {
   y: number;
   text: string;
   fontSize: number;
-  boxWidth: number; // controls text wrapping
+  boxWidth: number;
 }
 
 type CanvasItem = CanvasImage | CanvasText;
 
 type DragOp =
   | { kind: "move"; id: string; ox: number; oy: number }
-  | { kind: "resize-image"; id: string; startX: number; startW: number }
+  | { kind: "resize-image"; id: string; startX: number; startW: number; startH: number }
+  | { kind: "crop-edge"; id: string; edge: "left" | "right" | "top" | "bottom"; startPos: number; startCrop: number; startItemX: number; startItemY: number }
   | { kind: "resize-text-font"; id: string; startX: number; startFontSize: number }
   | { kind: "resize-text-width"; id: string; edge: "left" | "right"; startX: number; startBoxWidth: number; startItemX: number };
+
+/* ─── Avoidance helper ───────────────────────────────────────────────────── */
+
+interface LineLayout { indent: number; width: number; }
+
+function lineLayout(lineIndex: number, item: CanvasText, lineHeight: number, images: CanvasImage[]): LineLayout {
+  const lineTop = item.y + lineIndex * lineHeight;
+  const lineBottom = lineTop + lineHeight;
+  const lineMid = (lineTop + lineBottom) / 2;
+  const GUTTER = 8;
+  const textLeft = item.x;
+  const textRight = item.x + item.boxWidth;
+
+  let indentAbs = textLeft; // absolute left edge of available space
+  let rightAbs  = textRight; // absolute right edge of available space
+
+  for (const img of images) {
+    const fW = imgFrameW(img);
+    const fH = imgFrameH(img);
+    const imgX = img.x;
+    const imgY = img.y;
+    const imgRight = imgX + fW;
+    const imgBottom = imgY + fH;
+
+    if (imgY >= lineBottom || imgBottom <= lineTop) continue;
+
+    if (img.shape === "circle") {
+      const cx = imgX + fW / 2;
+      const cy = imgY + fH / 2;
+      const r = Math.min(fW, fH) / 2;
+      const dy = lineMid - cy;
+      if (Math.abs(dy) >= r) continue;
+      const chordHalf = Math.sqrt(r * r - dy * dy);
+      const circleLeft  = cx - chordHalf;
+      const circleRight = cx + chordHalf;
+      // Image intrudes from the right
+      if (circleLeft < textRight && circleLeft > indentAbs) rightAbs  = Math.min(rightAbs,  circleLeft  - GUTTER);
+      // Image intrudes from the left
+      if (circleRight > textLeft && circleRight < rightAbs)  indentAbs = Math.max(indentAbs, circleRight + GUTTER);
+    } else {
+      // Image intrudes from the right
+      if (imgX < textRight && imgX > indentAbs)   rightAbs  = Math.min(rightAbs,  imgX      - GUTTER);
+      // Image intrudes from the left
+      if (imgRight > textLeft && imgRight < rightAbs) indentAbs = Math.max(indentAbs, imgRight  + GUTTER);
+    }
+  }
+
+  const indent = Math.max(0, indentAbs - textLeft);
+  const width  = Math.max(20, rightAbs - textLeft - indent);
+  return { indent, width };
+}
 
 /* ─── Main component ─────────────────────────────────────────────────────── */
 
@@ -38,10 +106,12 @@ export default function CreatePage() {
   const [isDragOver, setIsDragOver] = useState(false);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [editingId, setEditingId] = useState<string | null>(null);
+  const [cropId, setCropId] = useState<string | null>(null);
   const canvasRef = useRef<HTMLDivElement>(null);
   const dragRef = useRef<DragOp | null>(null);
 
   const hasContent = items.length > 0;
+  const images = items.filter((i): i is CanvasImage => i.kind === "image");
 
   /* ── Global pointer move / up ─────────────────────────────────────────── */
   useEffect(() => {
@@ -53,43 +123,57 @@ export default function CreatePage() {
       if (op.kind === "move") {
         const x = Math.max(0, (e.clientX - rect.left) - op.ox);
         const y = Math.max(0, (e.clientY - rect.top) - op.oy);
-        setItems((prev) =>
-          prev.map((item) => (item.id === op.id ? { ...item, x, y } : item))
-        );
+        setItems((prev) => prev.map((item) => item.id === op.id ? { ...item, x, y } : item));
       } else if (op.kind === "resize-image") {
         const dx = e.clientX - op.startX;
         const newW = Math.max(60, Math.min(op.startW + dx, rect.width * 0.95));
-        setItems((prev) =>
-          prev.map((item) =>
-            item.id === op.id && item.kind === "image" ? { ...item, width: newW } : item
-          )
-        );
+        const scale = newW / op.startW;
+        const newH = op.startH * scale;
+        setItems((prev) => prev.map((item) =>
+          item.id === op.id && item.kind === "image"
+            ? { ...item, fullWidth: newW, fullHeight: newH, cropLeft: item.cropLeft * scale, cropRight: item.cropRight * scale, cropTop: item.cropTop * scale, cropBottom: item.cropBottom * scale }
+            : item
+        ));
+      } else if (op.kind === "crop-edge") {
+        const delta = op.edge === "left" || op.edge === "right"
+          ? e.clientX - op.startPos
+          : e.clientY - op.startPos;
+
+        setItems((prev) => prev.map((item) => {
+          if (item.id !== op.id || item.kind !== "image") return item;
+          const maxCropW = item.fullWidth * 0.9;
+          const maxCropH = item.fullHeight * 0.9;
+          if (op.edge === "left") {
+            const newCrop = Math.max(0, Math.min(op.startCrop + delta, maxCropW));
+            return { ...item, cropLeft: newCrop, x: op.startItemX + (newCrop - op.startCrop) };
+          }
+          if (op.edge === "right")  return { ...item, cropRight:  Math.max(0, Math.min(op.startCrop - delta, maxCropW)) };
+          if (op.edge === "top") {
+            const newCrop = Math.max(0, Math.min(op.startCrop + delta, maxCropH));
+            return { ...item, cropTop: newCrop, y: op.startItemY + (newCrop - op.startCrop) };
+          }
+          if (op.edge === "bottom") return { ...item, cropBottom: Math.max(0, Math.min(op.startCrop - delta, maxCropH)) };
+          return item;
+        }));
       } else if (op.kind === "resize-text-font") {
         const dx = e.clientX - op.startX;
         const newSize = Math.max(10, Math.min(op.startFontSize + dx / 3, 120));
-        setItems((prev) =>
-          prev.map((item) =>
-            item.id === op.id && item.kind === "text" ? { ...item, fontSize: newSize } : item
-          )
-        );
+        setItems((prev) => prev.map((item) =>
+          item.id === op.id && item.kind === "text" ? { ...item, fontSize: newSize } : item
+        ));
       } else if (op.kind === "resize-text-width") {
         const dx = e.clientX - op.startX;
         if (op.edge === "right") {
           const newW = Math.max(60, op.startBoxWidth + dx);
-          setItems((prev) =>
-            prev.map((item) =>
-              item.id === op.id && item.kind === "text" ? { ...item, boxWidth: newW } : item
-            )
-          );
+          setItems((prev) => prev.map((item) =>
+            item.id === op.id && item.kind === "text" ? { ...item, boxWidth: newW } : item
+          ));
         } else {
-          // left edge: move x and shrink width inversely
           const newW = Math.max(60, op.startBoxWidth - dx);
           const newX = op.startItemX + (op.startBoxWidth - newW);
-          setItems((prev) =>
-            prev.map((item) =>
-              item.id === op.id && item.kind === "text" ? { ...item, boxWidth: newW, x: newX } : item
-            )
-          );
+          setItems((prev) => prev.map((item) =>
+            item.id === op.id && item.kind === "text" ? { ...item, boxWidth: newW, x: newX } : item
+          ));
         }
       }
     };
@@ -102,61 +186,57 @@ export default function CreatePage() {
     };
   }, []);
 
-  /* ── Start move ───────────────────────────────────────────────────────── */
+  /* ── Callbacks ────────────────────────────────────────────────────────── */
   const startMove = useCallback((e: React.PointerEvent, item: CanvasItem) => {
     e.stopPropagation();
     setSelectedId(item.id);
+    setCropId(null);
     const rect = canvasRef.current?.getBoundingClientRect();
     if (!rect) return;
-    dragRef.current = {
-      kind: "move",
-      id: item.id,
-      ox: e.clientX - rect.left - item.x,
-      oy: e.clientY - rect.top - item.y,
-    };
+    dragRef.current = { kind: "move", id: item.id, ox: e.clientX - rect.left - item.x, oy: e.clientY - rect.top - item.y };
   }, []);
 
-  /* ── Start resize (image) ─────────────────────────────────────────────── */
   const startResizeImage = useCallback((e: React.PointerEvent, item: CanvasImage) => {
     e.stopPropagation();
-    dragRef.current = { kind: "resize-image", id: item.id, startX: e.clientX, startW: item.width };
+    dragRef.current = { kind: "resize-image", id: item.id, startX: e.clientX, startW: item.fullWidth, startH: item.fullHeight };
   }, []);
 
-  /* ── Start resize (text font size) ───────────────────────────────────── */
+  const startCropEdge = useCallback((e: React.PointerEvent, img: CanvasImage, edge: "left" | "right" | "top" | "bottom") => {
+    e.stopPropagation();
+    const startPos = (edge === "left" || edge === "right") ? e.clientX : e.clientY;
+    const startCrop = edge === "left" ? img.cropLeft : edge === "right" ? img.cropRight : edge === "top" ? img.cropTop : img.cropBottom;
+    dragRef.current = { kind: "crop-edge", id: img.id, edge, startPos, startCrop, startItemX: img.x, startItemY: img.y };
+  }, []);
+
   const startResizeTextFont = useCallback((e: React.PointerEvent, item: CanvasText) => {
     e.stopPropagation();
     dragRef.current = { kind: "resize-text-font", id: item.id, startX: e.clientX, startFontSize: item.fontSize };
   }, []);
 
-  /* ── Start resize (text box width) ───────────────────────────────────── */
   const startResizeTextWidth = useCallback((e: React.PointerEvent, item: CanvasText, edge: "left" | "right") => {
     e.stopPropagation();
-    dragRef.current = {
-      kind: "resize-text-width",
-      id: item.id,
-      edge,
-      startX: e.clientX,
-      startBoxWidth: item.boxWidth,
-      startItemX: item.x,
-    };
+    dragRef.current = { kind: "resize-text-width", id: item.id, edge, startX: e.clientX, startBoxWidth: item.boxWidth, startItemX: item.x };
   }, []);
 
-  /* ── Add text ─────────────────────────────────────────────────────────── */
+  const setImageShape = useCallback((id: string, shape: "rect" | "circle") => {
+    setItems((prev) => prev.map((item) =>
+      item.id === id && item.kind === "image" ? { ...item, shape } : item
+    ));
+  }, []);
+
   const addText = useCallback(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
     const { width, height } = canvas.getBoundingClientRect();
     const id = crypto.randomUUID();
-    const boxWidth = width * 0.55;
     setItems((prev) => [
       ...prev,
-      { kind: "text", id, x: (width - boxWidth) / 2, y: height * 0.1, text: "", fontSize: 18, boxWidth },
+      { kind: "text", id, x: (width - WRAP_WIDTH) / 2, y: height * 0.1, text: "", fontSize: 18, boxWidth: WRAP_WIDTH },
     ]);
     setSelectedId(id);
     setEditingId(id);
   }, []);
 
-  /* ── Drop photos ──────────────────────────────────────────────────────── */
   const handleDragOver = useCallback((e: React.DragEvent) => { e.preventDefault(); setIsDragOver(true); }, []);
   const handleDragLeave = useCallback((e: React.DragEvent) => { e.preventDefault(); setIsDragOver(false); }, []);
 
@@ -172,15 +252,28 @@ export default function CreatePage() {
         const src = URL.createObjectURL(file);
         const w = rect.width * 0.5;
         const id = crypto.randomUUID();
-        setItems((prev) => [
-          ...prev,
-          { kind: "image", id, src, x: (rect.width - w) / 2 + i * 16, y: rect.height * 0.15 + i * 16, width: w },
-        ]);
-        setSelectedId(id);
+        // Load image to get natural dimensions
+        const tmpImg = new window.Image();
+        tmpImg.onload = () => {
+          const ratio = tmpImg.naturalHeight / tmpImg.naturalWidth;
+          setItems((prev) => [
+            ...prev,
+            {
+              kind: "image", id, src,
+              x: (rect.width - w) / 2 + i * 16,
+              y: rect.height * 0.15 + i * 16,
+              fullWidth: w,
+              fullHeight: w * ratio,
+              shape: "rect",
+              cropLeft: 0, cropTop: 0, cropRight: 0, cropBottom: 0,
+            },
+          ]);
+          setSelectedId(id);
+        };
+        tmpImg.src = src;
       });
   }, []);
 
-  /* ── Undo ─────────────────────────────────────────────────────────────── */
   const handleUndo = useCallback(() => {
     setItems((prev) => {
       if (!prev.length) return prev;
@@ -190,20 +283,17 @@ export default function CreatePage() {
     });
     setSelectedId(null);
     setEditingId(null);
+    setCropId(null);
   }, []);
 
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
-      if ((e.metaKey || e.ctrlKey) && e.key === "z" && !editingId) {
-        e.preventDefault();
-        handleUndo();
-      }
+      if ((e.metaKey || e.ctrlKey) && e.key === "z" && !editingId) { e.preventDefault(); handleUndo(); }
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [handleUndo, editingId]);
 
-  /* ── Commit text (remove if empty) ───────────────────────────────────── */
   const commitText = useCallback((id: string, text: string) => {
     setEditingId(null);
     if (!text.trim()) {
@@ -215,7 +305,7 @@ export default function CreatePage() {
   return (
     <div
       className="flex flex-col h-full bg-white select-none"
-      onPointerDown={() => { setSelectedId(null); setEditingId(null); }}
+      onPointerDown={() => { setSelectedId(null); setEditingId(null); setCropId(null); }}
     >
       {/* Toolbar */}
       <header className="relative flex items-center h-14 px-4 bg-white border-b border-[#E5E5E5] flex-shrink-0">
@@ -234,11 +324,8 @@ export default function CreatePage() {
           <button className="w-9 h-9 flex items-center justify-center text-[#1A1A1A] hover:opacity-60 transition-opacity" aria-label="Color palette">
             <PaletteIcon />
           </button>
-          <button
-            onClick={handleUndo}
-            disabled={!hasContent}
+          <button onClick={handleUndo} disabled={!hasContent}
             className="w-9 h-9 flex items-center justify-center text-[#1A1A1A] hover:opacity-60 transition-opacity disabled:opacity-25"
-            aria-label="Undo"
           >
             <UndoIcon />
           </button>
@@ -258,11 +345,7 @@ export default function CreatePage() {
           onDragLeave={handleDragLeave}
           onDrop={handleDrop}
           className="bg-white border rounded-sm relative overflow-hidden transition-colors"
-          style={{
-            aspectRatio: "3/4",
-            width: "min(92vw, calc((100dvh - 160px) * 0.75))",
-            borderColor: isDragOver ? "#AAAAAA" : "#D7D7D7",
-          }}
+          style={{ aspectRatio: "4/3", width: "min(92vw, calc((100dvh - 160px) * (4/3)))", borderColor: isDragOver ? "#AAAAAA" : "#D7D7D7" }}
         >
           {isDragOver && (
             <div className="absolute inset-0 bg-black/5 flex items-center justify-center z-10 pointer-events-none">
@@ -278,35 +361,119 @@ export default function CreatePage() {
           )}
 
           {/* Images */}
-          {items.filter((i): i is CanvasImage => i.kind === "image").map((img) => (
-            <div
-              key={img.id}
-              onPointerDown={(e) => startMove(e, img)}
-              className="absolute"
-              style={{
-                left: img.x, top: img.y, width: img.width,
-                cursor: "grab",
-                outline: selectedId === img.id ? "2px solid rgba(0,120,255,0.6)" : "none",
-                outlineOffset: "2px",
-              }}
-            >
-              {/* eslint-disable-next-line @next/next/no-img-element */}
-              <img src={img.src} alt="" draggable={false} className="w-full block" />
-              {selectedId === img.id && (
+          {images.map((img) => {
+            const isCropping = cropId === img.id;
+            const isSelected = selectedId === img.id;
+            const fW = imgFrameW(img);
+            const fH = imgFrameH(img);
+
+            return (
+              <div key={img.id}>
+                {/* Per-image floating toolbar */}
+                {(isSelected || isCropping) && (
+                  <div
+                    onPointerDown={(e) => e.stopPropagation()}
+                    className="absolute flex gap-1 bg-white rounded-full shadow-md px-1.5 py-1 z-20"
+                    style={{ left: img.x + fW / 2, top: img.y - 40, transform: "translateX(-50%)" }}
+                  >
+                    <button onClick={() => setImageShape(img.id, "rect")}
+                      className={`w-6 h-6 rounded flex items-center justify-center transition-colors ${img.shape === "rect" ? "bg-black text-white" : "text-[#888] hover:bg-black/5"}`}
+                    ><RectIcon /></button>
+                    <button onClick={() => setImageShape(img.id, "circle")}
+                      className={`w-6 h-6 rounded-full flex items-center justify-center transition-colors ${img.shape === "circle" ? "bg-black text-white" : "text-[#888] hover:bg-black/5"}`}
+                    ><CircleIcon /></button>
+                    {!isCropping
+                      ? <button onClick={(e) => { e.stopPropagation(); setCropId(img.id); setSelectedId(img.id); }}
+                          className="w-6 h-6 rounded flex items-center justify-center text-[#888] hover:bg-black/5 transition-colors"
+                        ><CropIcon /></button>
+                      : <button onClick={(e) => { e.stopPropagation(); setCropId(null); }}
+                          className="w-6 h-6 rounded flex items-center justify-center bg-black text-white text-[10px] font-bold"
+                        >✓</button>
+                    }
+                  </div>
+                )}
+
+                {/* Image frame — clipped to cropped area */}
                 <div
-                  onPointerDown={(e) => startResizeImage(e, img)}
-                  className="absolute bottom-0 right-0 w-4 h-4 bg-white border border-[rgba(0,120,255,0.6)] rounded-sm"
-                  style={{ cursor: "se-resize", transform: "translate(50%,50%)" }}
-                />
-              )}
-            </div>
-          ))}
+                  onPointerDown={(e) => { if (!isCropping) startMove(e, img); else e.stopPropagation(); }}
+                  onDoubleClick={(e) => { e.stopPropagation(); setSelectedId(img.id); setCropId(img.id); }}
+                  className="absolute overflow-hidden"
+                  style={{
+                    left: img.x,
+                    top: img.y,
+                    width: fW,
+                    height: fH,
+                    borderRadius: img.shape === "circle" ? "50%" : 0,
+                    cursor: isCropping ? "default" : "grab",
+                    outline: isSelected && !isCropping ? "2px solid rgba(0,120,255,0.6)" : "none",
+                    outlineOffset: "2px",
+                    boxShadow: isCropping ? "0 0 0 2px rgba(0,120,255,0.6)" : "none",
+                  }}
+                >
+                  {/* eslint-disable-next-line @next/next/no-img-element */}
+                  <img
+                    src={img.src}
+                    alt=""
+                    draggable={false}
+                    style={{
+                      position: "absolute",
+                      width: img.fullWidth,
+                      height: img.fullHeight,
+                      maxWidth: "none",
+                      left: -img.cropLeft,
+                      top: -img.cropTop,
+                      pointerEvents: "none",
+                    }}
+                  />
+                </div>
+
+                {/* Crop edge handles — rendered outside the clipped frame */}
+                {isCropping && (() => {
+                  const handleStyle = (edge: "left"|"right"|"top"|"bottom"): React.CSSProperties => {
+                    const T = 8; // touch target half-thickness
+                    const VIS = 3; // visible bar thickness
+                    if (edge === "left")   return { position: "absolute", left: img.x - T,        top: img.y,           width: T * 2, height: fH, cursor: "ew-resize" };
+                    if (edge === "right")  return { position: "absolute", left: img.x + fW - T,   top: img.y,           width: T * 2, height: fH, cursor: "ew-resize" };
+                    if (edge === "top")    return { position: "absolute", left: img.x,             top: img.y - T,       width: fW,    height: T * 2, cursor: "ns-resize" };
+                    return                        { position: "absolute", left: img.x,             top: img.y + fH - T,  width: fW,    height: T * 2, cursor: "ns-resize" };
+                    void VIS;
+                  };
+                  return (["left","right","top","bottom"] as const).map((edge) => (
+                    <div
+                      key={edge}
+                      onPointerDown={(e) => startCropEdge(e, img, edge)}
+                      style={handleStyle(edge)}
+                      className="z-20 flex items-center justify-center"
+                    >
+                      {/* Visible bar */}
+                      <div style={{
+                        width: edge === "left" || edge === "right" ? 3 : "100%",
+                        height: edge === "top" || edge === "bottom" ? 3 : "100%",
+                        background: "rgba(0,120,255,0.7)",
+                        borderRadius: 2,
+                      }} />
+                    </div>
+                  ));
+                })()}
+
+                {/* Resize handle (bottom-right, only when selected not cropping) */}
+                {isSelected && !isCropping && (
+                  <div
+                    onPointerDown={(e) => startResizeImage(e, img)}
+                    className="absolute w-4 h-4 bg-white border border-[rgba(0,120,255,0.6)] rounded-sm z-10"
+                    style={{ left: img.x + fW, top: img.y + fH, cursor: "se-resize", transform: "translate(-50%,-50%)" }}
+                  />
+                )}
+              </div>
+            );
+          })}
 
           {/* Text items */}
           {items.filter((i): i is CanvasText => i.kind === "text").map((item) => (
             <TextItem
               key={item.id}
               item={item}
+              images={images}
               isEditing={editingId === item.id}
               isSelected={selectedId === item.id}
               onPointerDown={(e) => { if (editingId === item.id) return; startMove(e, item); }}
@@ -325,18 +492,14 @@ export default function CreatePage() {
 
 /* ─── TextItem ───────────────────────────────────────────────────────────── */
 
+interface TextLine { text: string; indent: number; }
+
 function TextItem({
-  item,
-  isEditing,
-  isSelected,
-  onPointerDown,
-  onDoubleClick,
-  onCommit,
-  onChange,
-  onResizeFontStart,
-  onResizeWidthStart,
+  item, images, isEditing, isSelected,
+  onPointerDown, onDoubleClick, onCommit, onChange, onResizeFontStart, onResizeWidthStart,
 }: {
   item: CanvasText;
+  images: CanvasImage[];
   isEditing: boolean;
   isSelected: boolean;
   onPointerDown: (e: React.PointerEvent) => void;
@@ -347,25 +510,39 @@ function TextItem({
   onResizeWidthStart: (e: React.PointerEvent, edge: "left" | "right") => void;
 }) {
   const taRef = useRef<HTMLTextAreaElement>(null);
+  const lineHeight = item.fontSize * LINE_HEIGHT_RATIO;
+  const fontString = `${item.fontSize}px MaryLouise, serif`;
 
-  const autoGrow = useCallback(() => {
-    const el = taRef.current;
-    if (!el) return;
-    el.style.height = "auto";
-    el.style.height = el.scrollHeight + 6 + "px";
-  }, []);
+  const lines = useMemo<TextLine[]>(() => {
+    if (!item.text) return [];
+    try {
+      const prepared = prepareWithSegments(item.text, fontString, { whiteSpace: "pre-wrap" });
+      const result: TextLine[] = [];
+      let cursor: LayoutCursor = { segmentIndex: 0, graphemeIndex: 0 };
+      let lineIndex = 0;
+      while (lineIndex < 500) {
+        const { indent, width } = lineLayout(lineIndex, item, lineHeight, images);
+        const line = layoutNextLine(prepared, cursor, width);
+        if (line === null) break;
+        result.push({ text: line.text, indent });
+        cursor = line.end;
+        lineIndex++;
+      }
+      return result;
+    } catch {
+      return [{ text: item.text, indent: 0 }];
+    }
+  }, [item, fontString, lineHeight, images]);
 
-  // Re-grow whenever font size, box width, or text changes
-  useEffect(() => { autoGrow(); }, [item.fontSize, item.boxWidth, item.text, autoGrow]);
+  const totalHeight = (lines.length || 1) * lineHeight + 6;
 
   useEffect(() => {
     if (isEditing && taRef.current) {
       taRef.current.focus();
       const len = taRef.current.value.length;
       taRef.current.setSelectionRange(len, len);
-      autoGrow();
     }
-  }, [isEditing, autoGrow]);
+  }, [isEditing]);
 
   return (
     <div
@@ -373,59 +550,48 @@ function TextItem({
       onDoubleClick={onDoubleClick}
       className="absolute"
       style={{
-        left: item.x,
-        top: item.y,
+        left: item.x, top: item.y, width: item.boxWidth, height: totalHeight,
         cursor: isEditing ? "text" : "grab",
         outline: isSelected && !isEditing ? "2px solid rgba(0,120,255,0.6)" : "none",
         outlineOffset: "4px",
       }}
     >
-      <textarea
-        ref={taRef}
-        value={item.text}
-        readOnly={!isEditing}
-        onChange={(e) => { onChange(e.target.value); autoGrow(); }}
-        onBlur={() => onCommit(item.text)}
-        onPointerDown={(e) => isEditing && e.stopPropagation()}
-        rows={1}
-        className="block bg-transparent border-none outline-none resize-none overflow-hidden leading-snug"
-        style={{
-          fontFamily: "MaryLouise, serif",
-          fontSize: item.fontSize,
-          color: "#1A1A1A",
-          width: item.boxWidth,
-          padding: 0,
-          margin: 0,
-          WebkitAppearance: "none",
-          caretColor: isEditing ? "#1A1A1A" : "transparent",
-          cursor: isEditing ? "text" : "grab",
-        }}
-        placeholder={isEditing ? "Type something…" : ""}
-      />
+      {isEditing ? (
+        <textarea
+          ref={taRef}
+          value={item.text}
+          onChange={(e) => onChange(e.target.value)}
+          onBlur={() => onCommit(item.text)}
+          onPointerDown={(e) => e.stopPropagation()}
+          rows={1}
+          className="block bg-transparent border-none outline-none resize-none overflow-hidden leading-snug w-full h-full"
+          style={{ fontFamily: "MaryLouise, serif", fontSize: item.fontSize, lineHeight: LINE_HEIGHT_RATIO, color: "#1A1A1A", padding: 0, margin: 0, WebkitAppearance: "none" }}
+          placeholder="Type something…"
+        />
+      ) : (
+        <div style={{ fontFamily: "MaryLouise, serif", fontSize: item.fontSize, lineHeight: LINE_HEIGHT_RATIO, color: "#1A1A1A", position: "relative", width: item.boxWidth, height: totalHeight }}>
+          {lines.map((line, i) => (
+            <span key={i} style={{ position: "absolute", top: i * lineHeight, left: line.indent, whiteSpace: "pre", display: "block" }}>
+              {line.text}
+            </span>
+          ))}
+          {lines.length === 0 && <span style={{ opacity: 0.35 }}>Type something…</span>}
+        </div>
+      )}
 
       {isSelected && !isEditing && (
         <>
-          {/* Left edge — resize box width */}
-          <div
-            onPointerDown={(e) => onResizeWidthStart(e, "left")}
+          <div onPointerDown={(e) => onResizeWidthStart(e, "left")}
             className="group/edge absolute top-0 bottom-0 flex items-center justify-center"
-            style={{ left: -8, width: 16, cursor: "ew-resize" }}
-          >
+            style={{ left: -8, width: 16, cursor: "ew-resize" }}>
             <div className="w-px h-full bg-[rgba(0,120,255,0.6)] opacity-0 group-hover/edge:opacity-100 transition-opacity" />
           </div>
-
-          {/* Right edge — resize box width */}
-          <div
-            onPointerDown={(e) => onResizeWidthStart(e, "right")}
+          <div onPointerDown={(e) => onResizeWidthStart(e, "right")}
             className="group/edge absolute top-0 bottom-0 flex items-center justify-center"
-            style={{ right: -8, width: 16, cursor: "ew-resize" }}
-          >
+            style={{ right: -8, width: 16, cursor: "ew-resize" }}>
             <div className="w-px h-full bg-[rgba(0,120,255,0.6)] opacity-0 group-hover/edge:opacity-100 transition-opacity" />
           </div>
-
-          {/* Bottom-right corner — resize font size */}
-          <div
-            onPointerDown={onResizeFontStart}
+          <div onPointerDown={onResizeFontStart}
             className="absolute bottom-0 right-0 w-4 h-4 bg-white border border-[rgba(0,120,255,0.6)] rounded-sm"
             style={{ cursor: "se-resize", transform: "translate(50%, 50%)" }}
           />
@@ -436,6 +602,30 @@ function TextItem({
 }
 
 /* ─── Icons ──────────────────────────────────────────────────────────────── */
+
+function CropIcon() {
+  return (
+    <svg width="12" height="12" viewBox="0 0 12 12" fill="none">
+      <path d="M3 1v7a1 1 0 001 1h7M1 3h7a1 1 0 011 1v7" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round"/>
+    </svg>
+  );
+}
+
+function RectIcon() {
+  return (
+    <svg width="12" height="12" viewBox="0 0 12 12" fill="none">
+      <rect x="1" y="1" width="10" height="10" rx="1" stroke="currentColor" strokeWidth="1.5" />
+    </svg>
+  );
+}
+
+function CircleIcon() {
+  return (
+    <svg width="12" height="12" viewBox="0 0 12 12" fill="none">
+      <circle cx="6" cy="6" r="5" stroke="currentColor" strokeWidth="1.5" />
+    </svg>
+  );
+}
 
 function TextIcon() {
   return (
