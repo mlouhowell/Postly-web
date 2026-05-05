@@ -10,6 +10,8 @@ const LINE_HEIGHT_RATIO = 1.35;
 
 /* ─── Types ──────────────────────────────────────────────────────────────── */
 
+interface Point { x: number; y: number; }
+
 interface CanvasImage {
   kind: "image";
   id: string;
@@ -23,6 +25,7 @@ interface CanvasImage {
   cropTop: number;
   cropRight: number;
   cropBottom: number;
+  lassoPoints: Point[] | null; // points relative to frame (px), null = no lasso clip
 }
 
 // Derived helpers
@@ -52,6 +55,30 @@ type DragOp =
 
 interface LineLayout { indent: number; width: number; }
 
+/**
+ * Scan polygon edges to find the min/max x intercepts at a given y (in polygon-local coords).
+ * Returns { left, right } in absolute canvas coords, or null if the line misses the polygon.
+ */
+function polygonXAtY(points: Point[], imgX: number, imgY: number, lineMid: number): { left: number; right: number } | null {
+  const localY = lineMid - imgY;
+  let minX = Infinity;
+  let maxX = -Infinity;
+  const n = points.length;
+  for (let i = 0; i < n; i++) {
+    const a = points[i];
+    const b = points[(i + 1) % n];
+    // Does this edge cross localY?
+    if ((a.y <= localY && b.y > localY) || (b.y <= localY && a.y > localY)) {
+      const t = (localY - a.y) / (b.y - a.y);
+      const x = a.x + t * (b.x - a.x);
+      minX = Math.min(minX, x);
+      maxX = Math.max(maxX, x);
+    }
+  }
+  if (!isFinite(minX)) return null;
+  return { left: imgX + minX, right: imgX + maxX };
+}
+
 function lineLayout(lineIndex: number, item: CanvasText, lineHeight: number, images: CanvasImage[]): LineLayout {
   const lineTop = item.y + lineIndex * lineHeight;
   const lineBottom = lineTop + lineHeight;
@@ -60,38 +87,45 @@ function lineLayout(lineIndex: number, item: CanvasText, lineHeight: number, ima
   const textLeft = item.x;
   const textRight = item.x + item.boxWidth;
 
-  let indentAbs = textLeft; // absolute left edge of available space
-  let rightAbs  = textRight; // absolute right edge of available space
+  let indentAbs = textLeft;
+  let rightAbs  = textRight;
 
   for (const img of images) {
     const fW = imgFrameW(img);
     const fH = imgFrameH(img);
     const imgX = img.x;
     const imgY = img.y;
-    const imgRight = imgX + fW;
     const imgBottom = imgY + fH;
 
     if (imgY >= lineBottom || imgBottom <= lineTop) continue;
 
-    if (img.shape === "circle") {
+    let imgLeft: number;
+    let imgRight: number;
+
+    if (img.lassoPoints && img.lassoPoints.length >= 3) {
+      // Use polygon x-intercepts at this line's midpoint
+      const intercept = polygonXAtY(img.lassoPoints, imgX, imgY, lineMid);
+      if (!intercept) continue;
+      imgLeft  = intercept.left;
+      imgRight = intercept.right;
+    } else if (img.shape === "circle") {
       const cx = imgX + fW / 2;
       const cy = imgY + fH / 2;
-      const r = Math.min(fW, fH) / 2;
+      const r  = Math.min(fW, fH) / 2;
       const dy = lineMid - cy;
       if (Math.abs(dy) >= r) continue;
       const chordHalf = Math.sqrt(r * r - dy * dy);
-      const circleLeft  = cx - chordHalf;
-      const circleRight = cx + chordHalf;
-      // Image intrudes from the right
-      if (circleLeft < textRight && circleLeft > indentAbs) rightAbs  = Math.min(rightAbs,  circleLeft  - GUTTER);
-      // Image intrudes from the left
-      if (circleRight > textLeft && circleRight < rightAbs)  indentAbs = Math.max(indentAbs, circleRight + GUTTER);
+      imgLeft  = cx - chordHalf;
+      imgRight = cx + chordHalf;
     } else {
-      // Image intrudes from the right
-      if (imgX < textRight && imgX > indentAbs)   rightAbs  = Math.min(rightAbs,  imgX      - GUTTER);
-      // Image intrudes from the left
-      if (imgRight > textLeft && imgRight < rightAbs) indentAbs = Math.max(indentAbs, imgRight  + GUTTER);
+      imgLeft  = imgX;
+      imgRight = imgX + fW;
     }
+
+    // Intrudes from the right of the text block
+    if (imgLeft < textRight && imgLeft > indentAbs)  rightAbs  = Math.min(rightAbs,  imgLeft  - GUTTER);
+    // Intrudes from the left of the text block
+    if (imgRight > textLeft && imgRight < rightAbs)  indentAbs = Math.max(indentAbs, imgRight + GUTTER);
   }
 
   const indent = Math.max(0, indentAbs - textLeft);
@@ -107,6 +141,9 @@ export default function CreatePage() {
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [editingId, setEditingId] = useState<string | null>(null);
   const [cropId, setCropId] = useState<string | null>(null);
+  const [scissorsId, setScissorsId] = useState<string | null>(null);
+  const [drawingPoints, setDrawingPoints] = useState<Point[]>([]);
+  const [previewPoint, setPreviewPoint] = useState<Point | null>(null);
   const canvasRef = useRef<HTMLDivElement>(null);
   const dragRef = useRef<DragOp | null>(null);
 
@@ -266,6 +303,7 @@ export default function CreatePage() {
               fullHeight: w * ratio,
               shape: "rect",
               cropLeft: 0, cropTop: 0, cropRight: 0, cropBottom: 0,
+              lassoPoints: null,
             },
           ]);
           setSelectedId(id);
@@ -294,6 +332,67 @@ export default function CreatePage() {
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [handleUndo, editingId]);
 
+  /* ── Scissors lasso ───────────────────────────────────────────────────── */
+  const startScissors = useCallback((id: string) => {
+    setScissorsId(id);
+    setDrawingPoints([]);
+    setPreviewPoint(null);
+    setCropId(null);
+    setSelectedId(id);
+  }, []);
+
+  const cancelScissors = useCallback(() => {
+    setScissorsId(null);
+    setDrawingPoints([]);
+    setPreviewPoint(null);
+  }, []);
+
+  const handleLassoClick = useCallback((e: React.MouseEvent, img: CanvasImage) => {
+    e.stopPropagation();
+    const fW = imgFrameW(img);
+    const fH = imgFrameH(img);
+    const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
+    const x = Math.max(0, Math.min(fW, e.clientX - rect.left));
+    const y = Math.max(0, Math.min(fH, e.clientY - rect.top));
+
+    setDrawingPoints((prev) => {
+      // Close path if clicking near the first point
+      if (prev.length >= 3) {
+        const first = prev[0];
+        const dist = Math.hypot(x - first.x, y - first.y);
+        if (dist < 16) {
+          // Apply lasso
+          setItems((items) => items.map((item) =>
+            item.id === img.id && item.kind === "image"
+              ? { ...item, lassoPoints: prev }
+              : item
+          ));
+          setScissorsId(null);
+          setDrawingPoints([]);
+          setPreviewPoint(null);
+          return prev;
+        }
+      }
+      return [...prev, { x, y }];
+    });
+  }, []);
+
+  const handleLassoMouseMove = useCallback((e: React.MouseEvent, img: CanvasImage) => {
+    if (scissorsId !== img.id) return;
+    const fW = imgFrameW(img);
+    const fH = imgFrameH(img);
+    const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
+    const x = Math.max(0, Math.min(fW, e.clientX - rect.left));
+    const y = Math.max(0, Math.min(fH, e.clientY - rect.top));
+    setPreviewPoint({ x, y });
+  }, [scissorsId]);
+
+  const clearLasso = useCallback((id: string) => {
+    setItems((prev) => prev.map((item) =>
+      item.id === id && item.kind === "image" ? { ...item, lassoPoints: null } : item
+    ));
+  }, []);
+
   const commitText = useCallback((id: string, text: string) => {
     setEditingId(null);
     if (!text.trim()) {
@@ -305,7 +404,7 @@ export default function CreatePage() {
   return (
     <div
       className="flex flex-col h-full bg-white select-none"
-      onPointerDown={() => { setSelectedId(null); setEditingId(null); setCropId(null); }}
+      onPointerDown={() => { setSelectedId(null); setEditingId(null); setCropId(null); cancelScissors(); }}
     >
       {/* Toolbar */}
       <header className="relative flex items-center h-14 px-4 bg-white border-b border-[#E5E5E5] flex-shrink-0">
@@ -382,50 +481,149 @@ export default function CreatePage() {
                     <button onClick={() => setImageShape(img.id, "circle")}
                       className={`w-6 h-6 rounded-full flex items-center justify-center transition-colors ${img.shape === "circle" ? "bg-black text-white" : "text-[#888] hover:bg-black/5"}`}
                     ><CircleIcon /></button>
-                    {!isCropping
-                      ? <button onClick={(e) => { e.stopPropagation(); setCropId(img.id); setSelectedId(img.id); }}
-                          className="w-6 h-6 rounded flex items-center justify-center text-[#888] hover:bg-black/5 transition-colors"
-                        ><CropIcon /></button>
-                      : <button onClick={(e) => { e.stopPropagation(); setCropId(null); }}
-                          className="w-6 h-6 rounded flex items-center justify-center bg-black text-white text-[10px] font-bold"
-                        >✓</button>
+                    {!isCropping && scissorsId !== img.id
+                      ? <>
+                          <button onClick={(e) => { e.stopPropagation(); setCropId(img.id); setSelectedId(img.id); }}
+                            className="w-6 h-6 rounded flex items-center justify-center text-[#888] hover:bg-black/5 transition-colors"
+                          ><CropIcon /></button>
+                          <button onClick={(e) => { e.stopPropagation(); startScissors(img.id); }}
+                            className={`w-6 h-6 rounded flex items-center justify-center transition-colors ${img.lassoPoints ? "bg-black text-white" : "text-[#888] hover:bg-black/5"}`}
+                          ><ScissorsIcon /></button>
+                          {img.lassoPoints && (
+                            <button onClick={(e) => { e.stopPropagation(); clearLasso(img.id); }}
+                              className="w-6 h-6 rounded flex items-center justify-center text-[#888] hover:bg-black/5 transition-colors text-[9px] font-bold"
+                              title="Clear lasso"
+                            >✕</button>
+                          )}
+                        </>
+                      : isCropping
+                        ? <button onClick={(e) => { e.stopPropagation(); setCropId(null); }}
+                            className="w-6 h-6 rounded flex items-center justify-center bg-black text-white text-[10px] font-bold"
+                          >✓</button>
+                        : <button onClick={(e) => { e.stopPropagation(); cancelScissors(); }}
+                            className="w-6 h-6 rounded flex items-center justify-center text-[#888] hover:bg-black/5 transition-colors text-[9px] font-bold"
+                            title="Cancel"
+                          >✕</button>
                     }
                   </div>
                 )}
 
                 {/* Image frame — clipped to cropped area */}
-                <div
-                  onPointerDown={(e) => { if (!isCropping) startMove(e, img); else e.stopPropagation(); }}
-                  onDoubleClick={(e) => { e.stopPropagation(); setSelectedId(img.id); setCropId(img.id); }}
-                  className="absolute overflow-hidden"
-                  style={{
-                    left: img.x,
-                    top: img.y,
-                    width: fW,
-                    height: fH,
-                    borderRadius: img.shape === "circle" ? "50%" : 0,
-                    cursor: isCropping ? "default" : "grab",
-                    outline: isSelected && !isCropping ? "2px solid rgba(0,120,255,0.6)" : "none",
-                    outlineOffset: "2px",
-                    boxShadow: isCropping ? "0 0 0 2px rgba(0,120,255,0.6)" : "none",
-                  }}
-                >
-                  {/* eslint-disable-next-line @next/next/no-img-element */}
-                  <img
-                    src={img.src}
-                    alt=""
-                    draggable={false}
-                    style={{
-                      position: "absolute",
-                      width: img.fullWidth,
-                      height: img.fullHeight,
-                      maxWidth: "none",
-                      left: -img.cropLeft,
-                      top: -img.cropTop,
-                      pointerEvents: "none",
-                    }}
-                  />
-                </div>
+                {(() => {
+                  const isLassoing = scissorsId === img.id;
+                  // Build clip-path string from stored lasso points
+                  const clipPath = img.lassoPoints && img.lassoPoints.length >= 3 && !isLassoing
+                    ? `polygon(${img.lassoPoints.map(p => `${(p.x / fW * 100).toFixed(2)}% ${(p.y / fH * 100).toFixed(2)}%`).join(", ")})`
+                    : img.shape === "circle" ? "circle(50%)" : undefined;
+
+                  return (
+                    <div
+                      onPointerDown={(e) => { if (!isCropping && !isLassoing) startMove(e, img); else e.stopPropagation(); }}
+                      onDoubleClick={(e) => { e.stopPropagation(); setSelectedId(img.id); setCropId(img.id); }}
+                      className="absolute overflow-hidden"
+                      style={{
+                        left: img.x,
+                        top: img.y,
+                        width: fW,
+                        height: fH,
+                        clipPath,
+                        borderRadius: img.shape === "circle" || clipPath ? 0 : 0,
+                        cursor: isCropping || isLassoing ? "default" : "grab",
+                        outline: isSelected && !isCropping && !isLassoing ? "2px solid rgba(0,120,255,0.6)" : "none",
+                        outlineOffset: "2px",
+                        boxShadow: isCropping ? "0 0 0 2px rgba(0,120,255,0.6)" : "none",
+                      }}
+                    >
+                      {/* eslint-disable-next-line @next/next/no-img-element */}
+                      <img
+                        src={img.src}
+                        alt=""
+                        draggable={false}
+                        style={{
+                          position: "absolute",
+                          width: img.fullWidth,
+                          height: img.fullHeight,
+                          maxWidth: "none",
+                          left: -img.cropLeft,
+                          top: -img.cropTop,
+                          pointerEvents: "none",
+                        }}
+                      />
+
+                      {/* Lasso outline — shown when selected and a lasso exists */}
+                      {isSelected && !isLassoing && img.lassoPoints && img.lassoPoints.length >= 3 && (
+                        <svg className="absolute inset-0 w-full h-full pointer-events-none" style={{ zIndex: 5 }}>
+                          <polygon
+                            points={img.lassoPoints.map(p => `${p.x},${p.y}`).join(" ")}
+                            fill="none"
+                            stroke="rgba(0,120,255,0.8)"
+                            strokeWidth="1.5"
+                            strokeDasharray="5 3"
+                          />
+                          {img.lassoPoints.map((p, i) => (
+                            <circle key={i} cx={p.x} cy={p.y} r="3" fill="white" stroke="rgba(0,120,255,0.8)" strokeWidth="1.5" />
+                          ))}
+                        </svg>
+                      )}
+
+                      {/* Lasso drawing overlay */}
+                      {isLassoing && (
+                        <svg
+                          className="absolute inset-0 w-full h-full"
+                          style={{ cursor: "crosshair", zIndex: 10 }}
+                          onClick={(e) => handleLassoClick(e, img)}
+                          onMouseMove={(e) => handleLassoMouseMove(e, img)}
+                        >
+                          {/* Dim overlay */}
+                          <rect width="100%" height="100%" fill="rgba(0,0,0,0.35)" />
+
+                          {/* Drawn polygon so far */}
+                          {drawingPoints.length >= 2 && (
+                            <polyline
+                              points={[...drawingPoints, ...(previewPoint ? [previewPoint] : [])].map(p => `${p.x},${p.y}`).join(" ")}
+                              fill="none"
+                              stroke="white"
+                              strokeWidth="1.5"
+                              strokeDasharray="4 3"
+                            />
+                          )}
+                          {/* Preview line from last point to cursor */}
+                          {drawingPoints.length >= 1 && previewPoint && (
+                            <line
+                              x1={drawingPoints[drawingPoints.length - 1].x}
+                              y1={drawingPoints[drawingPoints.length - 1].y}
+                              x2={previewPoint.x}
+                              y2={previewPoint.y}
+                              stroke="white"
+                              strokeWidth="1.5"
+                              strokeDasharray="4 3"
+                              strokeOpacity="0.6"
+                            />
+                          )}
+                          {/* Placed points */}
+                          {drawingPoints.map((p, i) => (
+                            <circle key={i} cx={p.x} cy={p.y} r={i === 0 ? 7 : 3}
+                              fill={i === 0 ? "rgba(255,255,255,0.9)" : "white"}
+                              stroke="rgba(0,120,255,0.8)" strokeWidth="1.5"
+                            />
+                          ))}
+                          {/* Instruction */}
+                          {drawingPoints.length === 0 && (
+                            <text x="50%" y="50%" textAnchor="middle" dominantBaseline="middle"
+                              fill="white" fontSize="12" fontFamily="system-ui">
+                              Click to place points
+                            </text>
+                          )}
+                          {drawingPoints.length >= 3 && (
+                            <text x="50%" y="92%" textAnchor="middle" fill="white" fontSize="11" fontFamily="system-ui">
+                              Click ● to close
+                            </text>
+                          )}
+                        </svg>
+                      )}
+                    </div>
+                  );
+                })()}
 
                 {/* Crop edge handles — rendered outside the clipped frame */}
                 {isCropping && (() => {
@@ -602,6 +800,16 @@ function TextItem({
 }
 
 /* ─── Icons ──────────────────────────────────────────────────────────────── */
+
+function ScissorsIcon() {
+  return (
+    <svg width="13" height="13" viewBox="0 0 13 13" fill="none">
+      <circle cx="3" cy="3.5" r="1.8" stroke="currentColor" strokeWidth="1.3" />
+      <circle cx="3" cy="9.5" r="1.8" stroke="currentColor" strokeWidth="1.3" />
+      <path d="M4.6 4.5L11 11M4.6 8.5L11 2" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" />
+    </svg>
+  );
+}
 
 function CropIcon() {
   return (
